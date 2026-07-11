@@ -42,6 +42,9 @@ function looksLikeEncString(value: string): boolean {
  */
 function validateKdfParams(kdfType: number | undefined, kdfIterations: number | undefined, kdfMemory?: number | undefined, kdfParallelism?: number | undefined): string | null {
   const type = kdfType ?? 0;
+  if (type !== 0 && type !== 1) {
+    return 'KDF type must be PBKDF2-SHA256 or Argon2id';
+  }
   if (type === 0) {
     // PBKDF2-SHA256: minimum 100 000 iterations
     if (typeof kdfIterations === 'number' && kdfIterations < 100_000) {
@@ -349,7 +352,7 @@ export async function handleRegister(request: Request, env: Env): Promise<Respon
     securityStamp: generateUUID(),
     role: 'user',
     status: 'active',
-    verifyDevices: true,
+    verifyDevices: false, // new-device verification requires email delivery (not available)
     totpSecret: null,
     totpRecoveryCode: null,
     yubikeyKey1: null,
@@ -448,7 +451,7 @@ export async function handleGetPasswordHint(request: Request, env: Env): Promise
   }
 
   const rateLimit = new RateLimitService(env.DB);
-  const minuteBudget = await rateLimit.consumeBudgetWithWindow(
+  const minuteBudget = await rateLimit.consumeStrictBudgetWithWindow(
     `${clientIdentifier}:password-hint`,
     LIMITS.rateLimit.passwordHintRequestsPerMinute,
     60
@@ -470,7 +473,7 @@ export async function handleGetPasswordHint(request: Request, env: Env): Promise
     );
   }
 
-  const hourlyBudget = await rateLimit.consumeBudgetWithWindow(
+  const hourlyBudget = await rateLimit.consumeStrictBudgetWithWindow(
     `${clientIdentifier}:password-hint-hour`,
     LIMITS.rateLimit.passwordHintRequestsPerHour,
     60 * 60
@@ -550,51 +553,31 @@ export async function handleUpdateProfile(request: Request, env: Env, userId: st
 }
 
 // PUT/POST /api/accounts/verify-devices
+// New-device verification requires an email delivery channel which NodeWarden
+// does not provide. This endpoint always rejects the request so clients receive
+// clear feedback that the feature is unavailable rather than silently ignoring
+// the user's preference.
 export async function handleSetVerifyDevices(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
   const auth = new AuthService(env);
   const user = await storage.getUserById(userId);
   if (!user) return errorResponse('User not found', 404);
 
-  let body: {
-    secret?: string;
-    masterPasswordHash?: string;
-    verifyDevices?: boolean;
-    VerifyDevices?: boolean;
-  };
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse('Invalid JSON', 400);
-  }
-
-  const verifyDevices = typeof body.verifyDevices === 'boolean' ? body.verifyDevices : body.VerifyDevices;
-  if (typeof verifyDevices !== 'boolean') {
-    return errorResponse('verifyDevices must be true or false', 400);
-  }
-
-  const verified = await verifyUserSecret(auth, user, body.secret || body.masterPasswordHash);
-  if (!verified) {
-    return errorResponse('User verification failed.', 400);
-  }
-
-  user.verifyDevices = verifyDevices;
-  user.updatedAt = new Date().toISOString();
-  await storage.saveUser(user);
+  // Log the attempt for audit purposes, but do not change state.
   await writeAuditEvent(storage, {
     actorUserId: user.id,
-    action: 'account.verify_devices.update',
+    action: 'account.verify_devices.update.rejected',
     category: 'security',
-    level: 'security',
+    level: 'info',
     targetType: 'user',
     targetId: user.id,
     metadata: {
-      verifyDevices: user.verifyDevices,
+      reason: 'new-device verification is not supported (no email delivery channel)',
       ...auditRequestMetadata(request),
     },
   });
 
-  return new Response(null, { status: 200 });
+  return errorResponse('New device verification is not available on this server. Enable TOTP or WebAuthn two-factor authentication instead.', 400);
 }
 
 // GET /api/accounts/keys
@@ -734,6 +717,11 @@ export async function handleChangePassword(request: Request, env: Env, userId: s
   const nextKdfParallelism = body.kdfParallelism ?? readNestedNumber(body, ['unlockData', 'kdf', 'parallelism']);
   const kdfErr = validateKdfParams(nextKdf, nextKdfIterations, nextKdfMemory, nextKdfParallelism);
   if (kdfErr) return errorResponse(kdfErr, 400);
+  const shouldUpdateHint = typeof body.masterPasswordHint === 'string' || body.masterPasswordHint === null;
+  const nextMasterPasswordHint = shouldUpdateHint ? normalizeMasterPasswordHint(body.masterPasswordHint) : undefined;
+  if (nextMasterPasswordHint && nextMasterPasswordHint.length > 120) {
+    return errorResponse('masterPasswordHint must be 120 characters or fewer', 400);
+  }
 
   user.masterPasswordHash = await auth.hashPasswordServer(newMasterPasswordHash, user.email);
   if (nextKey) user.key = nextKey;
@@ -743,8 +731,8 @@ export async function handleChangePassword(request: Request, env: Env, userId: s
   if (typeof nextKdfIterations === 'number') user.kdfIterations = nextKdfIterations;
   if (typeof nextKdfMemory === 'number') user.kdfMemory = nextKdfMemory;
   if (typeof nextKdfParallelism === 'number') user.kdfParallelism = nextKdfParallelism;
-  if (typeof body.masterPasswordHint === 'string' || body.masterPasswordHint === null) {
-    user.masterPasswordHint = body.masterPasswordHint;
+  if (shouldUpdateHint) {
+    user.masterPasswordHint = nextMasterPasswordHint ?? null;
   }
   user.securityStamp = generateUUID();
   user.updatedAt = new Date().toISOString();
@@ -808,6 +796,21 @@ function yubiKeyResponse(user: User): Record<string, unknown> {
     Key5: user.yubikeyKey5,
     Nfc: !!user.yubikeyNfc,
     Object: 'twoFactorYubiKey',
+  };
+}
+
+// New-device verification requires an email delivery channel to send OTP
+// challenges to unknown devices. NodeWarden does not integrate with an email
+// provider, so this feature is intentionally unavailable. The settings
+// response always reports disabled regardless of any legacy DB value.
+function deviceVerificationSettingsResponse(_user: User): Record<string, unknown> {
+  return {
+    Enabled: false,
+    enabled: false,
+    VerifyDevices: false,
+    verifyDevices: false,
+    Object: 'deviceVerificationSettings',
+    object: 'deviceVerificationSettings',
   };
 }
 
@@ -883,6 +886,56 @@ export async function handleGetTwoFactorYubiKey(request: Request, env: Env, user
   if (!verified) return errorResponse('User verification failed.', 400);
 
   return jsonResponse(await yubiKeySettingsResponse(storage, env, user));
+}
+
+// POST /api/two-factor/get-device-verification-settings
+export async function handleGetDeviceVerificationSettings(request: Request, env: Env, userId: string): Promise<Response> {
+  void request;
+  const storage = new StorageService(env.DB);
+  const user = await storage.getUserById(userId);
+  if (!user) return errorResponse('User not found', 404);
+  return jsonResponse(deviceVerificationSettingsResponse(user));
+}
+
+// PUT/POST /api/two-factor/device-verification-settings
+// New-device verification is not supported (no email delivery channel).
+// Reject any attempt to enable it; always return disabled state.
+export async function handlePutDeviceVerificationSettings(request: Request, env: Env, userId: string): Promise<Response> {
+  const storage = new StorageService(env.DB);
+  const user = await storage.getUserById(userId);
+  if (!user) return errorResponse('User not found', 404);
+
+  let body: Record<string, unknown>;
+  try {
+    body = await readRequestBody(request);
+  } catch {
+    return errorResponse('Invalid JSON', 400);
+  }
+
+  const rawEnabled = body.enabled ?? body.Enabled ?? body.verifyDevices ?? body.VerifyDevices;
+
+  // Log the attempt for audit purposes — never change state.
+  await writeAuditEvent(storage, {
+    actorUserId: user.id,
+    action: 'account.verify_devices.update.rejected',
+    category: 'security',
+    level: 'info',
+    targetType: 'user',
+    targetId: user.id,
+    metadata: {
+      requested: rawEnabled,
+      reason: 'new-device verification is not supported (no email delivery channel)',
+      source: 'two-factor.device-verification-settings',
+      ...auditRequestMetadata(request),
+    },
+  });
+
+  if (rawEnabled === true) {
+    return errorResponse('New device verification is not available on this server. Enable TOTP or WebAuthn two-factor authentication instead.', 400);
+  }
+
+  // Setting to false is the only supported state — return it.
+  return jsonResponse(deviceVerificationSettingsResponse(user));
 }
 
 // PUT/POST /api/two-factor/authenticator
@@ -1089,16 +1142,8 @@ export async function handleDisableTwoFactorProvider(request: Request, env: Env,
     return errorResponse('Two-factor provider is not supported by this server.', 400);
   }
 
-  const key = normalizeTotpSecret(readBodyString(body, ['key', 'Key']));
-  const userVerificationToken = readBodyString(body, ['userVerificationToken', 'UserVerificationToken']);
   const secret = readBodyString(body, ['masterPasswordHash', 'MasterPasswordHash', 'otp', 'OTP', 'secret', 'Secret']);
-  let verified = false;
-  if (key && userVerificationToken) {
-    verified = await verifyTotpUserVerificationToken(env, user, key, userVerificationToken);
-  }
-  if (!verified) {
-    verified = await verifyUserSecret(auth, user, secret);
-  }
+  const verified = await verifyUserSecret(auth, user, secret);
   if (!verified) return errorResponse('User verification failed.', 400);
 
   if (type === TWO_FACTOR_PROVIDER_AUTHENTICATOR) {
